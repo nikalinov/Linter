@@ -2,124 +2,153 @@ import re
 import sys
 import os
 import ast
-from copy import deepcopy
+from pathlib import Path
+from ast_parsing import AstParser
+from error_descr import error_descr
 
 
-def is_snake_case(name):
-    return re.match(r'[a-z_][a-z0-9_()]*', name)
+class Linter:
+    """
+    Linter class. Functionality:
 
+    -- given a .py file or directory path, find style and naming errors
+       for the file or all the .py files in the directory.
 
-def is_camel_case(name):
-    return re.match(r'[A-Z][A-Za-z0-9()^_]', name)
+    How to invoke: create an instance and use analyze(path) method.
+    """
+    def __init__(self):
+        """
+        Initialize 2 dictionaries:
+        all_errors -- dictionary with errors from all files. Structure:
 
+        {<file_path_1>: {<line_no_1>: ['S001', 'S002', ..., ['S008', <class_name>],
+                                                            ['S009', <func_name>],
+                                                            ...
+                                                            ['S011', <var_name>]],
+                         <line_no_2>: [...],
+                         ...}
+         <file_path_2>: {<line_no_1>: ['S001', 'S002', ..., ['S008', <class_name>],
+                                                            ['S009', <func_name>],
+                                                            ...
+                                                            ['S011', <var_name>]],
+                         <line_no_2>: [...],
+                         ...}
+         ...}
 
-# dictionary with S008, S009, S010, S011, S012 errors for each line
-dic = {}
+        file_errors -- dictionary with local file errors. Structure:
+                       same as ast_parsing.py 'errors' dictionary (see the docstring)
 
+        files -- list with file path(s)
+        """
+        self.all_errors = {}
+        self.file_errors = {}
+        self.files = []
 
-def check_functions(tree):
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            # check if each argument of a function is in snake_case style
-            for arg in node.args.args:
-                if not is_snake_case(arg.arg):
-                    dic[node.lineno]["S010"].append(arg.arg)
-            # check all assignment variable names for snake_case style
-            for body_node in node.body:
-                if isinstance(body_node, ast.Assign):
-                    for var in body_node.targets:
-                        if isinstance(var, ast.Name) and not is_snake_case(var.id):
-                            dic[var.lineno]["S011"].append(var.id)
-            # check if any default values of the arguments are mutable
-            for val in node.args.defaults:
-                if isinstance(val, ast.List) or \
-                   isinstance(val, ast.Dict) or \
-                   isinstance(val, ast.Set):
-                    dic[node.lineno]["S012"] = True
-                    break
-            # check if function names are in snake_case
-            if not is_snake_case(node.name):
-                dic[node.lineno]["S009"] = node.name
-        elif isinstance(node, ast.ClassDef):
-            # check if class names are in snake_case
-            if not is_camel_case(node.name):
-                dic[node.lineno]["S008"] = node.name
+    def get_py_files(self, path):
+        """
+        Append .py file(s) to the 'files' instance variable.
+        If path is a directory, find all .py files' paths in the subdirectories,
+        if path is a file, append only it to the files list.
 
+        :param: path -- relative or absolute directory or file path
+        :return: None
+        """
+        if os.path.isfile(path):
+            self.files.append(path)
+            return
 
-def analyze(file_name):
-    if not os.access(file_name, os.R_OK):
-        return
+        if os.path.isabs(path):
+            path = path[2:]
 
-    file = open(file_name, encoding="utf8").read()
+        for path in Path(path).rglob('*.py'):
+            self.files.append(path)
 
-    global dic
-    subdict = {"S008": "", "S009": "", "S010": [], "S011": [], "S012": False}
-    dic = {line_num: deepcopy(subdict) for line_num in range(1, file.count('\n') + 2)}
+    def sort_errors(self):
+        for line_no, error_list in self.file_errors.items():
+            # sort list of format:
+            # [["S008", <class_name],...,["S011", <var_name>], "S001", ..., "S007"] =>
+            # => ["S001", ..., "S007", ["S008", <class_name],...,["S011", <var_name>]]
+            error_list.sort(key=lambda x: isinstance(x, list))
 
-    tree = ast.parse(file)
-    #print(ast.dump(tree, indent=2))
-    check_functions(tree)
+    def add_style_errors(self, file):
+        """
+        Given a file data, find style errors S001, S002, ...,
+        S007 (full list is in error_descr.py) and append them to
+        a list with the name errors.
 
-    blank_line = 0
-    for i, line in enumerate(file.split('\n'), start=1):
-        if len(line) > 79:
-            print(f'{file_name}: Line {i}: S001 Too Long')
+        :param: file -- file data in string format
+        :return: None
+        """
+        blank_lines = 0
+        for i, line in enumerate(file.split('\n'), start=1):
+            if len(line) > 79:
+                self.file_errors.setdefault(i, []).append("S001")
 
-        if (len(line) - len(line.lstrip(' '))) % 4 != 0:
-            print(f'{file_name}: Line {i}: S002 Indentation is not a multiple of four')
+            if (len(line) - len(line.lstrip(' '))) % 4 != 0:
+                self.file_errors.setdefault(i, []).append("S002")
 
-        if '#' in line and line.split('#')[0].strip().endswith(';'):
-            print(f'{file_name}: Line {i}: S003 Unnecessary semicolon')
+            if ('#' in line and line.split('#')[0].strip().endswith(';')) or \
+                    ('#' not in line and line.strip().endswith(';')):
+                self.file_errors.setdefault(i, []).append("S003")
 
-        if '#' not in line and line.strip().endswith(';'):
-            print(f'{file_name}: Line {i}: S003 Unnecessary semicolon')
+            if not line.startswith('#') and '#' in line and \
+                    not line.split('#')[0].endswith('  '):
+                self.file_errors.setdefault(i, []).append("S004")
+            if '#' in line and 'todo' in line.split('#')[1].lower():
+                self.file_errors.setdefault(i, []).append("S005")
 
-        if not line.startswith('#') and '#' in line and not line.split('#')[0].endswith('  '):
-            print(f'{file_name}: Line {i}: S004 At least two spaces before inline comment required')
+            if not line.strip():
+                blank_lines += 1
+            else:
+                if blank_lines > 2:
+                    self.file_errors.setdefault(i, []).append("S006")
+                blank_lines = 0
 
-        if '#' in line and 'todo' in line.split('#')[1].lower():
-            print(f'{file_name}: Line {i}: S005 TODO found')
+            if ('def' in line or 'class' in line) and \
+                    not re.match(r'\s*(def|class) \S', line):
+                self.file_errors.setdefault(i, []).append("S007")
 
-        if not line.strip():
-            blank_line += 1
-        else:
-            if blank_line > 2:
-                print(f'{file_name}: Line {i}: S006 More than two blank lines used before this line')
-            blank_line = 0
+        self.sort_errors()
 
-        if ('def' in line or 'class' in line) and not re.match(r'\s*(def|class) \S', line):
-            print(f"{file_name}: Line {i}: S007 Too many spaces after {'def' if 'def' in line else 'class'}")
+    def print_result(self):
+        for file_path, file_errors in self.all_errors.items():
+            for line_no, error_list in sorted(file_errors.items(), key=lambda x: x[0]):
+                for error in error_list:
+                    if isinstance(error, list):
+                        error, entity_name = error[0], error[1]
+                        message = error_descr[error].replace('-', entity_name)
+                        print(f"{file_path}: Line {line_no}: {error} {message}")
+                    else:
+                        message = error_descr[error]
+                        print(f"{file_path}: Line {line_no}: {error} {message}")
 
-        for error, val in dic[i].items():
-            if error == "S008" and val:
-                print(f"{file_name}: Line {i}: S008 Class name '{val}' should be written in CamelCase")
-            elif error == "S009" and val:
-                print(f"{file_name}: Line {i}: S009 Function name {val} should be written in snake_case")
-            elif error == "S010":
-                for arg in val:
-                    print(f"{file_name}: Line {i}: S010 Argument name {arg} should be written in snake_case")
-            elif error == "S011":
-                for var in val:
-                    print(f"{file_name}: Line {i}: S011 Variable {var} should be written in snake_case")
-            elif val:
-                print(f"{file_name}: Line {i}: S012 The default argument value is mutable")
+    def analyze(self, path):
+        self.get_py_files(path)
+        for file_path in self.files:
+            self.analyze_file(file_path)
+        self.print_result()
 
+    def analyze_file(self, path):
+        """
+        Given a .py file path, find naming and style errors and
+        record them in the 'all_errors' instance variable.
 
-def analyze_directory(dir_path):
-    if not os.access(dir_path, os.R_OK):
-        return
-    for file_or_dir in os.listdir(dir_path):
-        abs_path = os.path.join(dir_path, file_or_dir)
-        if os.path.isfile(abs_path) and file_or_dir != "tests.py":
-            analyze(abs_path)
+        :param: path: absolute or relative file path.
+        :return: None
+        """
+        file = open(path, encoding="utf8").read()
+        tree = ast.parse(file)
+        ast_parser = AstParser()
+
+        self.file_errors = ast_parser.name_errors(tree)
+        self.add_style_errors(file)
+        self.all_errors[path] = self.file_errors
 
 
 def main():
-    inp = sys.argv[-1]
-    if os.path.isfile(inp):
-        analyze(inp)
-    else:
-        analyze_directory(inp)
+    path = sys.argv[-1]
+    linter = Linter()
+    linter.analyze(path)
 
 
 if __name__ == "__main__":
